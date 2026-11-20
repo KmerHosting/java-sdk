@@ -19,9 +19,11 @@ import java.util.UUID;
 /** Official, synchronous KmerHosting API v1 client. */
 public final class KmerHostingClient {
   private static final String DEFAULT_BASE_URL = "https://api.kmerhosting.com";
+  private static final String DEFAULT_DOMAIN_SEARCH_URL = "https://domain.kmerhosting.com";
 
   private final String apiKey;
   private final String baseUrl;
+  private final String domainSearchUrl;
   private final Duration timeout;
   private final HttpClient httpClient;
   private final ObjectMapper mapper;
@@ -35,11 +37,17 @@ public final class KmerHostingClient {
   }
 
   public KmerHostingClient(String apiKey, String baseUrl, Duration timeout, HttpClient httpClient, ObjectMapper mapper) {
+    this(apiKey, baseUrl, timeout, httpClient, mapper, DEFAULT_DOMAIN_SEARCH_URL);
+  }
+
+  /** Same as above, with the public domain search service URL (default https://domain.kmerhosting.com). */
+  public KmerHostingClient(String apiKey, String baseUrl, Duration timeout, HttpClient httpClient, ObjectMapper mapper, String domainSearchUrl) {
     if (apiKey == null || apiKey.isBlank()) {
       throw new IllegalArgumentException("Set KMERHOSTING_API_KEY or pass an API key to KmerHostingClient.");
     }
     this.apiKey = apiKey;
     this.baseUrl = baseUrl.replaceAll("/+$", "");
+    this.domainSearchUrl = domainSearchUrl.replaceAll("/+$", "");
     this.timeout = timeout;
     this.httpClient = httpClient;
     this.mapper = mapper;
@@ -55,19 +63,25 @@ public final class KmerHostingClient {
 
   JsonNode get(String path) { return request("GET", path, null, null); }
 
+  JsonNode publicDomainSearch(String pathAndQuery) { return request("GET", domainSearchUrl + pathAndQuery, null, null, false); }
+
   JsonNode mutate(String method, String path, Object payload, String idempotencyKey) {
     return request(method, path, payload, idempotencyKey == null || idempotencyKey.isBlank() ? UUID.randomUUID().toString() : idempotencyKey);
   }
 
   private JsonNode request(String method, String path, Object payload, String idempotencyKey) {
+    return request(method, baseUrl + path, payload, idempotencyKey, true);
+  }
+
+  private JsonNode request(String method, String url, Object payload, String idempotencyKey, boolean authenticated) {
     try {
       HttpRequest.BodyPublisher body = payload == null
           ? HttpRequest.BodyPublishers.noBody()
           : HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(payload));
-      HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(baseUrl + path))
+      HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url))
           .timeout(timeout)
-          .header("Accept", "application/json")
-          .header("Authorization", "Bearer " + apiKey);
+          .header("Accept", "application/json");
+      if (authenticated) builder.header("Authorization", "Bearer " + apiKey);
       if (payload != null) builder.header("Content-Type", "application/json");
       if (idempotencyKey != null) builder.header("Idempotency-Key", idempotencyKey);
       HttpResponse<String> response = httpClient.send(builder.method(method, body).build(), HttpResponse.BodyHandlers.ofString());
@@ -127,6 +141,21 @@ public final class KmerHostingClient {
     public JsonNode list() { return client.get("/v1/domains"); }
     public JsonNode get(String domainId) { return client.get("/v1/domains/" + id(domainId)); }
     public DnsResource dns() { return new DnsResource(client); }
+
+    /**
+     * Checks availability and price of 1 to 20 domains. Public endpoint on domain.kmerhosting.com:
+     * no API key is sent; limited to 20 requests per IP per minute (a bulk search counts once).
+     * Returns {"results": [...]}.
+     */
+    public JsonNode search(List<String> domains) {
+      List<String> list = domains.stream().map(String::trim).filter(d -> !d.isEmpty()).toList();
+      if (list.isEmpty() || list.size() > 20) {
+        throw new IllegalArgumentException("Pass between 1 and 20 domains to domains().search().");
+      }
+      return client.publicDomainSearch("/api/domain-search?domains=" + id(String.join(",", list)));
+    }
+
+    public JsonNode search(String domain) { return search(List.of(domain)); }
     public JsonNode setAutoRenew(String domainId, boolean enabled, String idempotencyKey) {
       return client.mutate("PUT", "/v1/domains/" + id(domainId) + "/auto-renew", Map.of("enabled", enabled), idempotencyKey);
     }
