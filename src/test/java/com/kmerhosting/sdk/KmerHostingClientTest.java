@@ -32,6 +32,34 @@ class KmerHostingClientTest {
   }
 
   @Test
+  void searchesDomainsOnThePublicServiceWithoutTheApiKey() throws IOException {
+    List<String> seen = new ArrayList<>();
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext("/", exchange -> {
+      seen.add(exchange.getRequestMethod() + " " + exchange.getRequestURI().getRawPath() + "?" + exchange.getRequestURI().getRawQuery()
+          + " auth=" + exchange.getRequestHeaders().containsKey("Authorization"));
+      byte[] body = "{\"results\":[{\"domainName\":\"example.com\"},{\"domainName\":\"example.cm\"}]}".getBytes();
+      exchange.getResponseHeaders().add("Content-Type", "application/json");
+      exchange.sendResponseHeaders(200, body.length);
+      exchange.getResponseBody().write(body);
+      exchange.close();
+    });
+    server.start();
+    try {
+      String local = "http://127.0.0.1:" + server.getAddress().getPort();
+      KmerHostingClient client = new KmerHostingClient("kh_live_test", "http://127.0.0.1:1", Duration.ofSeconds(5), HttpClient.newHttpClient(), new ObjectMapper(), local + "/");
+      assertEquals(2, client.domains().search(List.of("example.com", " example.cm ")).path("results").size());
+      assertEquals(List.of("GET /api/domain-search?domains=example.com%2Cexample.cm auth=false"), seen);
+      assertThrows(IllegalArgumentException.class, () -> client.domains().search(List.of()));
+      List<String> tooMany = new ArrayList<>();
+      for (int i = 0; i < 21; i++) tooMany.add("d" + i + ".com");
+      assertThrows(IllegalArgumentException.class, () -> client.domains().search(tooMany));
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
   void mapsEveryPublicOperationToTheApiContract() throws IOException {
     List<String> requests = new ArrayList<>();
     AtomicBoolean errorMode = new AtomicBoolean(false);
