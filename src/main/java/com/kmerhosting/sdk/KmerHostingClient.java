@@ -12,6 +12,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -27,6 +29,7 @@ public final class KmerHostingClient {
   private final Duration timeout;
   private final HttpClient httpClient;
   private final ObjectMapper mapper;
+  private final RetryPolicy retryPolicy;
 
   public KmerHostingClient() {
     this(System.getenv("KMERHOSTING_API_KEY"));
@@ -42,6 +45,11 @@ public final class KmerHostingClient {
 
   /** Same as above, with the public domain search service URL (default https://domain.kmerhosting.com). */
   public KmerHostingClient(String apiKey, String baseUrl, Duration timeout, HttpClient httpClient, ObjectMapper mapper, String domainSearchUrl) {
+    this(apiKey, baseUrl, timeout, httpClient, mapper, domainSearchUrl, RetryPolicy.defaults());
+  }
+
+  /** Same as above, with an explicit {@link RetryPolicy} ({@link RetryPolicy#disabled()} turns retries off). */
+  public KmerHostingClient(String apiKey, String baseUrl, Duration timeout, HttpClient httpClient, ObjectMapper mapper, String domainSearchUrl, RetryPolicy retryPolicy) {
     if (apiKey == null || apiKey.isBlank()) {
       throw new IllegalArgumentException("Set KMERHOSTING_API_KEY or pass an API key to KmerHostingClient.");
     }
@@ -51,6 +59,7 @@ public final class KmerHostingClient {
     this.timeout = timeout;
     this.httpClient = httpClient;
     this.mapper = mapper;
+    this.retryPolicy = retryPolicy == null ? RetryPolicy.defaults() : retryPolicy;
   }
 
   public AccountResource account() { return new AccountResource(this); }
@@ -84,11 +93,34 @@ public final class KmerHostingClient {
       if (authenticated) builder.header("Authorization", "Bearer " + apiKey);
       if (payload != null) builder.header("Content-Type", "application/json");
       if (idempotencyKey != null) builder.header("Idempotency-Key", idempotencyKey);
-      HttpResponse<String> response = httpClient.send(builder.method(method, body).build(), HttpResponse.BodyHandlers.ofString());
+      HttpRequest httpRequest = builder.method(method, body).build();
+      HttpResponse<String> response;
+      int attempt = 1;
+      while (true) {
+        // The request (headers and body, including the Idempotency-Key) is reused unchanged on every attempt.
+        response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+        if (!RetryPolicy.retryable(response.statusCode()) || attempt >= retryPolicy.maxAttempts()) break;
+        retryPolicy.sleep(retryPolicy.delay(attempt, retryAfter(response)));
+        attempt++;
+      }
       JsonNode parsed = parse(response.body());
       if (response.statusCode() < 200 || response.statusCode() >= 300) {
         JsonNode error = parsed.path("error");
+        if (error.isTextual()) {
+          // The public domain-search service answers {"error": "<code>", "message": "..."}.
+          error = mapper.createObjectNode().put("code", error.asText()).put("message", parsed.path("message").asText("KmerHosting API request failed with status " + response.statusCode() + "."));
+        }
         String requestId = error.path("request_id").asText(response.headers().firstValue("X-Request-Id").orElse(null));
+        if (response.statusCode() == 429) {
+          throw new KmerHostingRateLimitException(
+              error.path("message").asText("KmerHosting API rate limit exceeded."),
+              error.path("code").asText("rate_limit_exceeded"),
+              requestId,
+              parsed,
+              retryAfter(response),
+              intHeader(response, "X-RateLimit-Limit"),
+              intHeader(response, "X-RateLimit-Remaining"));
+        }
         throw new KmerHostingApiException(
             error.path("message").asText("KmerHosting API request failed with status " + response.statusCode() + "."),
             response.statusCode(),
@@ -105,6 +137,30 @@ public final class KmerHostingClient {
     } catch (InterruptedException error) {
       Thread.currentThread().interrupt();
       throw new KmerHostingApiException("The KmerHosting API request was interrupted.", 0, "request_interrupted", null, NullNode.instance);
+    }
+  }
+
+  private static Duration retryAfter(HttpResponse<?> response) {
+    String value = response.headers().firstValue("Retry-After").orElse(null);
+    if (value == null || value.isBlank()) return null;
+    try {
+      double seconds = Double.parseDouble(value.trim());
+      return seconds < 0 ? null : Duration.ofMillis((long) (seconds * 1000));
+    } catch (NumberFormatException ignored) {
+      try {
+        Duration until = Duration.between(ZonedDateTime.now(), ZonedDateTime.parse(value.trim(), DateTimeFormatter.RFC_1123_DATE_TIME));
+        return until.isNegative() ? Duration.ZERO : until;
+      } catch (RuntimeException invalid) {
+        return null;
+      }
+    }
+  }
+
+  private static Integer intHeader(HttpResponse<?> response, String name) {
+    try {
+      return response.headers().firstValue(name).map(v -> Integer.valueOf(v.trim())).orElse(null);
+    } catch (NumberFormatException ignored) {
+      return null;
     }
   }
 

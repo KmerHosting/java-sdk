@@ -2,7 +2,7 @@ package com.kmerhosting.sdk;
 
 import com.fasterxml.jackson.databind.JsonNode;
 
-public final class KmerHostingApiException extends RuntimeException {
+public class KmerHostingApiException extends RuntimeException {
   private final int status;
   private final String code;
   private final String requestId;
