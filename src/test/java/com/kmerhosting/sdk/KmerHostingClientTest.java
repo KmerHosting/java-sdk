@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
 
@@ -147,6 +148,72 @@ class KmerHostingClientTest {
       KmerHostingApiException malformed = assertThrows(KmerHostingApiException.class, () -> client.account().get());
       assertEquals(502, malformed.status());
       assertEquals("request_failed", malformed.code());
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  void retriesRateLimitsAndGatewayErrorsReusingTheIdempotencyKey() throws IOException {
+    List<String> keys = new ArrayList<>();
+    AtomicInteger calls = new AtomicInteger();
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext("/", exchange -> {
+      keys.add(String.valueOf(exchange.getRequestHeaders().getFirst("Idempotency-Key")));
+      int n = calls.incrementAndGet();
+      if (n == 1) exchange.getResponseHeaders().add("Retry-After", "2");
+      String response = n <= 2 ? "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}" : "{\"data\":{\"ok\":true},\"request_id\":\"r2\"}";
+      exchange.getRequestBody().readAllBytes();
+      exchange.sendResponseHeaders(n == 1 ? 429 : n == 2 ? 502 : 202, response.getBytes().length);
+      exchange.getResponseBody().write(response.getBytes());
+      exchange.close();
+    });
+    server.start();
+    try {
+      List<Duration> waits = new ArrayList<>();
+      KmerHostingClient client = new KmerHostingClient("kh_live_test", "http://127.0.0.1:" + server.getAddress().getPort(), Duration.ofSeconds(5),
+          HttpClient.newHttpClient(), new ObjectMapper(), "http://127.0.0.1:1", RetryPolicy.defaults().withSleeper(waits::add));
+      client.kvm().action(ID, KvmAction.RESTART, null);
+      assertEquals(3, calls.get());
+      assertEquals(1, keys.stream().distinct().count());
+      assertTrue(!keys.get(0).equals("null"));
+      assertTrue(waits.get(0).toMillis() >= 2000 && waits.get(0).toMillis() <= 2300);
+      assertTrue(waits.get(1).toMillis() <= 1000);
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  void throwsRateLimitExceptionWithRetryAfterAndCanDisableRetries() throws IOException {
+    AtomicInteger calls = new AtomicInteger();
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext("/", exchange -> {
+      calls.incrementAndGet();
+      exchange.getResponseHeaders().add("Retry-After", "7");
+      exchange.getResponseHeaders().add("X-RateLimit-Limit", "60");
+      exchange.getResponseHeaders().add("X-RateLimit-Remaining", "0");
+      String response = "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\",\"request_id\":\"r1\"}}";
+      exchange.sendResponseHeaders(429, response.getBytes().length);
+      exchange.getResponseBody().write(response.getBytes());
+      exchange.close();
+    });
+    server.start();
+    try {
+      String base = "http://127.0.0.1:" + server.getAddress().getPort();
+      KmerHostingClient client = new KmerHostingClient("kh_live_test", base, Duration.ofSeconds(5), HttpClient.newHttpClient(), new ObjectMapper(), "http://127.0.0.1:1", RetryPolicy.defaults().withSleeper(d -> { }));
+      KmerHostingRateLimitException error = assertThrows(KmerHostingRateLimitException.class, () -> client.account().get());
+      assertEquals(3, calls.get());
+      assertEquals(Duration.ofSeconds(7), error.retryAfter());
+      assertEquals(60, error.limit());
+      assertEquals(429, error.status());
+      assertEquals("rate_limit_exceeded", error.code());
+      assertTrue(error instanceof KmerHostingApiException);
+
+      calls.set(0);
+      KmerHostingClient single = new KmerHostingClient("kh_live_test", base, Duration.ofSeconds(5), HttpClient.newHttpClient(), new ObjectMapper(), "http://127.0.0.1:1", RetryPolicy.disabled());
+      assertThrows(KmerHostingRateLimitException.class, () -> single.account().get());
+      assertEquals(1, calls.get());
     } finally {
       server.stop(0);
     }
